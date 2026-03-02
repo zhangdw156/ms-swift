@@ -1,4 +1,5 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import os
 import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Literal
@@ -202,12 +203,91 @@ def preprocess_logits_for_acc(logits: torch.Tensor, labels: torch.Tensor) -> tor
     return preds
 
 
+# Tokenizer for hardtry_tool_call metric (set by mixin when metric is used)
+_hardtry_tokenizer = None
+
+
+def set_hardtry_tokenizer(tokenizer):
+    """Set tokenizer for hardtry_tool_call metric. Called by SwiftMixin when metric='hardtry_tool_call'."""
+    global _hardtry_tokenizer
+    _hardtry_tokenizer = tokenizer
+
+
+def compute_hardtry_tool_call_metrics(eval_prediction: EvalPrediction) -> Dict[str, float]:
+    """
+    Compute tool_call score using hardtry RL reward (same as VeRL eval).
+    Requires: hardtry on PYTHONPATH and metric tokenizer set by trainer.
+    Returns metrics that will appear in eval logs and SwanLab (e.g. eval_tool_call_score).
+
+    Reward module can be selected via env: HARDTRY_REWARD_MODULE=reward_fn_grpo (default),
+    reward_fn_egpo (for <think>...</think> + tool_call), or reward_fn (format+correctness split).
+    """
+    global _hardtry_tokenizer
+    module_name = os.environ.get('HARDTRY_REWARD_MODULE', 'reward_fn_grpo')
+    try:
+        from importlib import import_module
+        mod = import_module(f'hardtry.rl.{module_name}')
+        compute_score = mod.compute_score
+    except ImportError:
+        logger.warning(
+            f'hardtry_tool_call metric: cannot import hardtry.rl.{module_name}. '
+            'Add hardtry to PYTHONPATH or install it. Skipping metric.'
+        )
+        return {}
+
+    tokenizer = _hardtry_tokenizer
+    if tokenizer is None:
+        logger.warning(
+            'hardtry_tool_call metric: tokenizer not set. '
+            'Ensure SwiftMixin sets it when metric=hardtry_tool_call. Skipping metric.'
+        )
+        return {}
+
+    preds = eval_prediction.predictions
+    labels = eval_prediction.label_ids
+    if isinstance(preds, torch.Tensor):
+        preds = preds.cpu().numpy()
+    if isinstance(labels, torch.Tensor):
+        labels = labels.cpu().numpy()
+
+    if preds.ndim < 2 or labels.ndim < 2 or preds.shape != labels.shape:
+        return {}
+
+    scores = []
+    for i in range(preds.shape[0]):
+        label_row = labels[i]
+        pred_row = preds[i]
+        # Only decode response part (where label != -100)
+        mask = label_row != -100
+        if not np.any(mask):
+            continue
+        pred_ids = pred_row[mask]
+        label_ids = label_row[mask]
+        try:
+            solution_str = tokenizer.decode(pred_ids, skip_special_tokens=True)
+            ground_truth = tokenizer.decode(label_ids, skip_special_tokens=True)
+        except Exception:
+            continue
+        score = compute_score(None, solution_str, ground_truth, None)
+        scores.append(score)
+
+    if not scores:
+        return {}
+    return {'tool_call_score': float(np.mean(scores))}
+
+
 # Add your own metric calculation method here, use --metric xxx to train
 metric_mapping = {
     'acc': (compute_acc_metrics, preprocess_logits_for_acc),
     'nlg': (compute_nlg_metrics, None),
+    'hardtry_tool_call': (compute_hardtry_tool_call_metrics, preprocess_logits_for_acc),
 }
 
 
 def get_metric(metric: str):
+    if metric not in metric_mapping:
+        raise KeyError(
+            f'Unknown metric: {metric!r}. Available: {list(metric_mapping.keys())}. '
+            'Register custom metrics in metric_mapping or via external_plugins.'
+        )
     return metric_mapping[metric]

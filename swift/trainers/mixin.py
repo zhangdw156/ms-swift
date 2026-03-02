@@ -956,6 +956,9 @@ class SwiftMixin:
         res = {}
         if args.metric is not None:
             res['compute_metrics'], res['preprocess_logits_for_metrics'] = get_metric(args.metric)
+            if args.metric == 'hardtry_tool_call':
+                from swift.plugin.metric import set_hardtry_tokenizer
+                set_hardtry_tokenizer(self.template.tokenizer)
         if args.loss_type is not None:
             res['compute_loss_func'] = get_loss_func(args.loss_type)
         return res
